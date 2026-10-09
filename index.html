@@ -1,0 +1,812 @@
+<!DOCTYPE html>
+<!--
+  index.html — 煎蛋世界模型：可玩的 2D 俯视煎蛋模拟器（界面层）
+
+  这是什么：
+    一个单文件网页。双击（file://）或 Live Server 打开即可玩。
+    画面、鼠标拖拽、键盘、倍速、日志、下载、自测、批量按钮都在这里；
+    但【所有规则】都在同目录的 egg_core.js 里（window.EggCore），本文件一条规则也不写、也不改。
+    换句话说：本文件只负责「把拖放翻译成动作字符串」和「把 15 个状态数字画出来」。
+
+  怎么用：
+    1. 把本文件和 egg_core.js 放在同一个文件夹，双击 index.html。
+    2. 鼠标拖拽：锅→灶 = PLACE_PAN；锅→桌 = REMOVE_PAN；点灶旋钮 = IGNITE/FLAME_OFF；
+       油壶→锅 = POUR_OIL；蛋盒里的蛋→锅 = CRACK_EGG；铲→锅里的蛋 = FLIP；锅里的蛋→盘 = PLATE。
+    3. 键盘 1–9 依次 = WAIT, PLACE_PAN, REMOVE_PAN, IGNITE, FLAME_OFF, POUR_OIL, CRACK_EGG, FLIP, PLATE。
+    4. 右侧面板：调试（显示 15 个隐藏/可见数值）、Self-test（7 条自测）、Batch（批量生成日志）、下载 JSONL/CSV。
+    5. 输入切换「鼠标 / 手势」：同目录有 hand.js 且用 localhost/https 打开时可切到摄像头手势；否则灰掉。
+    6. 不开浏览器的检查：在本目录运行  node smoke_test.js  （语法检查 + 假 DOM 跑一回合 + 日志格式断言）。
+
+  给同学的「改这里」索引（搜索 【改这里】 即可）：
+    - 颜色：CSS 变量（<style> 顶部）与 JS 里的 COLORS / EGG_RAMP
+    - 物体位置与尺寸：JS 里的 LAYOUT
+    - 拖放映射：JS 里的 onPointerUp() 中「落点 → 动作」那一段
+    - 键盘映射：JS 里的 onKeyDown()
+    - 回合随机种子：JS 里的 INTERACTIVE_SEED
+
+  给同学的 10 行白话：鼠标拖放是怎么变成一行日志的
+    1. 你按下鼠标压住「油壶」，程序记下「正在拖油壶」。
+    2. 你移动鼠标，画面上油壶跟着光标走（只是画，状态没变）。
+    3. 你松开鼠标，程序看松开的位置在不在锅的圆圈里。
+    4. 在锅里 → 程序调用 EggGame.dispatch('POUR_OIL')，把这个字符串放进 inputQueue 队列。
+    5. 时钟每 1 秒（×1 倍速）响一次，叫一个 tick。
+    6. tick 到了：从队列取出一个动作（队列空就取 'WAIT'）。
+    7. 先把「动作之前」的 15 个数字四舍五入到 2 位小数，连同回合号、t、k、动作一起压进 LOG。
+    8. 再调用 EggCore.step(state, action, k) 得到新状态（规则全在 egg_core.js）。
+    9. 画面按新状态重画：油=1 就画油光。
+   10. 回合结束时（PLATE / 误操作 / 300 tick），用 EggCore.judge 得出结局，回填到本回合每一行的 outcome。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>煎蛋世界模型 · 模拟器</title>
+<style>
+  /* 【改这里】界面配色（CSS 变量） */
+  :root {
+    --bg: #f4efe6;
+    --panel: #ffffff;
+    --line: #d9d2c5;
+    --text: #222;
+    --muted: #777;
+    --accent: #c0392b;
+    --ok: #1e8449;
+    --bad: #b03a2e;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; background: var(--bg); color: var(--text); }
+  .wrap { display: flex; gap: 16px; padding: 16px; align-items: flex-start; }
+  .left { flex: 0 0 auto; }
+  #game { display: block; background: #e8dcc5; border: 2px solid #8a7a5c; border-radius: 6px; touch-action: none; cursor: grab; }
+  #game.dragging { cursor: grabbing; }
+  .status { margin-top: 10px; min-height: 64px; }
+  #outcome { font-size: 36px; font-weight: 800; letter-spacing: 2px; line-height: 1.1; }
+  #outcome.ok { color: var(--ok); }
+  #outcome.bad { color: var(--bad); }
+  #hint { font-size: 15px; color: var(--muted); margin-top: 2px; }
+  #episodeInfo { font-size: 13px; color: var(--muted); margin-top: 4px; }
+  .controls { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  button { font-size: 14px; padding: 6px 12px; border: 1px solid #999; background: #fafafa; border-radius: 4px; cursor: pointer; }
+  button:hover { background: #eee; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.active { background: #333; color: #fff; border-color: #333; }
+  .group { display: inline-flex; gap: 4px; align-items: center; padding: 2px 6px; border: 1px dashed var(--line); border-radius: 4px; }
+  .group span.lbl { font-size: 12px; color: var(--muted); margin-right: 2px; }
+  .right { flex: 0 0 380px; display: flex; flex-direction: column; gap: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; }
+  .card h3 { margin: 0 0 8px 0; font-size: 15px; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; font-family: Menlo, Consolas, monospace; }
+  td, th { border-bottom: 1px solid #eee; padding: 2px 4px; text-align: left; }
+  td.num { text-align: right; }
+  td.hidden-field { color: #a04; }
+  .pass { color: var(--ok); font-weight: bold; }
+  .fail { color: var(--bad); font-weight: bold; }
+  pre { margin: 6px 0 0 0; font-size: 12px; white-space: pre-wrap; background: #fafafa; padding: 6px; border-radius: 4px; max-height: 220px; overflow: auto; }
+  input[type=number] { width: 80px; font-size: 13px; padding: 3px; }
+  .legend { font-size: 12px; line-height: 1.6; }
+  .legend code { background: #f0f0f0; padding: 0 3px; border-radius: 3px; }
+  .small { font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <!-- ========== 左侧：画布 + 状态 + 控制 ========== -->
+  <div class="left">
+    <canvas id="game" width="960" height="600"></canvas>
+
+    <div class="status">
+      <div id="outcome">—</div>
+      <div id="hint">拖拽物体或按键盘 1–9 开始煎蛋。</div>
+      <div id="episodeInfo"></div>
+    </div>
+
+    <div class="controls">
+      <button id="btnStart">Start</button>
+      <button id="btnReset">Reset</button>
+      <span class="group"><span class="lbl">倍速</span>
+        <button id="spd1" class="active">×1</button>
+        <button id="spd4">×4</button>
+        <button id="spd8">×8</button>
+      </span>
+      <span class="group"><span class="lbl">输入</span>
+        <label><input type="radio" name="inputMode" value="mouse" id="inputMouse" checked> 鼠标</label>
+        <label id="inputHandLabel"><input type="radio" name="inputMode" value="hand" id="inputHand"> 手势</label>
+        <span id="handStatus" class="small"></span>
+        <!-- hand.js 会优先使用 id="hand-toggle" 的按钮（并往里写状态文字）；这里把它藏起来，统一用上面的单选框切换 -->
+        <button id="hand-toggle" type="button" hidden></button>
+      </span>
+    </div>
+  </div>
+
+  <!-- ========== 右侧：调试 / 自测 / 批量 / 下载 / 图例 ========== -->
+  <div class="right">
+    <div class="card">
+      <h3><label><input type="checkbox" id="chkDebug"> 调试面板（显示全部 15 个值，红色 = 画面上隐藏的量）</label></h3>
+      <table id="debugTable" style="display:none"></table>
+    </div>
+
+    <div class="card">
+      <h3>Self-test（7 条自测，k = 1.0）</h3>
+      <button id="btnSelfTest">运行 Self-test</button>
+      <table id="selfTestTable"></table>
+    </div>
+
+    <div class="card">
+      <h3>Batch 批量生成（40% 带噪专家 / 35% 变体专家 / 25% 合法随机）</h3>
+      N <input type="number" id="batchN" value="2000" min="1" step="1">
+      seed <input type="number" id="batchSeed" value="1" step="1">
+      <button id="btnBatch">运行 Batch</button>
+      <button id="btnBatchClear" disabled>丢弃批量结果</button>
+      <div id="batchProgress" class="small"></div>
+      <pre id="batchOut" style="display:none"></pre>
+    </div>
+
+    <div class="card">
+      <h3>下载日志</h3>
+      <button id="btnJsonl">Download JSONL</button>
+      <button id="btnCsv">Download CSV</button>
+      <div id="downloadNote" class="small">目前会下载：互动日志（LOG）。运行 Batch 后改为下载批量结果。</div>
+    </div>
+
+    <div class="card legend">
+      <h3>操作图例</h3>
+      拖 <b>锅</b>→灶 <code>PLACE_PAN</code>，锅→桌 <code>REMOVE_PAN</code><br>
+      点 <b>灶旋钮</b> <code>IGNITE</code> / <code>FLAME_OFF</code><br>
+      拖 <b>油壶</b>→锅 <code>POUR_OIL</code>；拖 <b>蛋盒的蛋</b>→锅 <code>CRACK_EGG</code><br>
+      拖 <b>锅铲</b>→锅里的蛋 <code>FLIP</code>；拖 <b>锅里的蛋</b>→盘 <code>PLATE</code><br>
+      键盘 <code>1</code> WAIT <code>2</code> PLACE_PAN <code>3</code> REMOVE_PAN <code>4</code> IGNITE <code>5</code> FLAME_OFF
+      <code>6</code> POUR_OIL <code>7</code> CRACK_EGG <code>8</code> FLIP <code>9</code> PLATE<br>
+      每 tick 最多执行一个动作，多余的排队等下一 tick。<br>
+      输入「手势」= 摄像头捏合代替鼠标（需同目录 hand.js，且用 localhost / https 打开；file:// 下摄像头不可用，自动退回鼠标）。
+    </div>
+  </div>
+</div>
+
+<!-- 规则核心：所有规则只在这里 -->
+<script src="egg_core.js"></script>
+
+<script>
+(function () {
+  'use strict';
+  const EggCore = window.EggCore;
+  if (!EggCore) { alert('找不到 egg_core.js，请把它和 index.html 放在同一个文件夹。'); return; }
+
+  // =====================================================================
+  // 0. 常量：【改这里】颜色、尺寸、布局
+  // =====================================================================
+  const INTERACTIVE_SEED = 20261009;   // 【改这里】互动回合的随机种子（决定每回合的隐藏灶功率 k 序列）
+  const POLICY_HUMAN = 'human';        // 互动日志的 policy 标签（批量数据里是 expert/variant/random）
+
+  const COLORS = {                      // 【改这里】画面颜色
+    table: '#d9c39a', tableGrain: 'rgba(120,90,40,0.10)',
+    stove: '#3b3f46', stoveEdge: '#22252a', burner: '#1c1e22', burnerRing: '#5c6066',
+    knob: '#c9c9c9', knobMark: '#222', knobOn: '#e74c3c',
+    flameBlue: '#3aa0ff', flameOrange: '#ff9a1f', flameYellow: '#ffe066',
+    pan: '#2f2f2f', panInner: '#4a4a4a', panRim: '#6a6a6a', panHandle: '#1f1f1f',
+    oilSheen: 'rgba(255,220,120,0.45)', oilHighlight: 'rgba(255,255,255,0.35)',
+    spatula: '#8f8f8f', spatulaHandle: '#5a3b1e',
+    carton: '#c9b79c', cartonEdge: '#8a7555', eggShell: '#f4ecd8', eggShellEdge: '#c9b89a',
+    oilBottle: '#f0c040', oilBottleEdge: '#9a7a10', oilCap: '#333',
+    plate: '#ffffff', plateEdge: '#bbb', plateInner: '#eef2f5',
+    puddle: 'rgba(255,215,90,0.75)', puddleYolk: '#f5a623',
+    label: 'rgba(0,0,0,0.55)', banner: 'rgba(0,0,0,0.55)'
+  };
+
+  // 蛋白颜色阶梯（朝上那面的熟度 cook_up → 颜色）。透明黄 → 白 → 金黄 → 棕 → 黑。【改这里】
+  const EGG_RAMP = [
+    [0.00, 255, 238, 180, 0.35],
+    [0.30, 255, 255, 255, 0.95],
+    [0.80, 247, 226, 165, 1.00],
+    [1.05, 214, 160,  70, 1.00],
+    [1.30, 120,  70,  30, 1.00],
+    [1.50,  20,  15,  10, 1.00]
+  ];
+  const YOLK_RAW = [255, 175, 40], YOLK_BLACK = [60, 35, 15];
+
+  const LAYOUT = {                      // 【改这里】物体位置与尺寸（画布 960×600，坐标原点左上）
+    stove:   { x: 520, y: 40, w: 400, h: 310 },
+    burner:  { x: 700, y: 190, r: 72 },
+    knob:    { x: 870, y: 300, r: 20 },
+    panHome: { x: 250, y: 200 },        // 锅在桌上时的位置
+    panR: 78, panHandleLen: 110,
+    spatula: { x: 60, y: 385, w: 230, h: 40 },  // 铲子外接框（左边是铲面）
+    carton:  { x: 50, y: 470, w: 230, h: 110, cols: 3, rows: 2 },
+    oil:     { x: 395, y: 445, w: 50, h: 115 },   // 油壶外接框
+    plate:   { x: 730, y: 470, r: 72 },
+    puddle:  { x: 460, y: 405 },        // 误操作的一滩（放在结局横幅 y 230–350 之外，否则会被横幅挡住）
+    egg:     { rx: 52, ry: 44, yolkR: 18 }
+  };
+
+  // =====================================================================
+  // 1. 游戏状态（界面层自己的变量；规则状态 state 来自 EggCore）
+  // =====================================================================
+  const episodeRng = EggCore.mulberry32(INTERACTIVE_SEED);   // 每回合抽一次 k，和 generateBatch 同一种写法
+  let state = EggCore.newState();
+  let k = 1.0;
+  let ep = -1;                 // 回合号，reset() 后从 0 开始
+  let done = null;             // null | 'END' | 'TIMEOUT'
+  let outcome = null;          // 回合结束后的结局字符串
+  let inputQueue = [];         // 排队的动作，每 tick 取一个
+  const LOG = [];              // 所有互动回合的日志行（CONTRACT 格式）
+  let episodeRowStart = 0;     // 本回合在 LOG 里的起始下标，用于回填 outcome
+  let running = false;
+  let speed = 1;               // 1 / 4 / 8，只改 tick 间隔
+  let timer = null;
+  let batchRows = null;        // 运行 Batch 后保存，供下载
+  let frame = 0;               // 画面帧计数（只用于火苗微微闪动，不进规则）
+  let lastAction = 'WAIT';     // 上一 tick 执行的动作（状态栏显示）
+
+  // 拖拽状态：{type:'pan'|'spatula'|'oil'|'egg'|'panEgg', x, y}
+  let drag = null;
+
+  // =====================================================================
+  // 2. DOM
+  // =====================================================================
+  const $ = (id) => document.getElementById(id);
+  const canvas = $('game');
+  const ctx = canvas.getContext('2d');
+  const elOutcome = $('outcome'), elHint = $('hint'), elEpisode = $('episodeInfo');
+  const chkDebug = $('chkDebug'), debugTable = $('debugTable');
+
+  // =====================================================================
+  // 3. 主循环：固定步长 tick；倍速只改间隔
+  // =====================================================================
+  function tick() {
+    if (done) return;                                // 回合已结束，等 Reset
+    const a = inputQueue.length ? inputQueue.shift() : 'WAIT';
+    LOG.push({ ep: ep, t: state.t, k: k, a: a, policy: POLICY_HUMAN, outcome: null, s: roundState(state) });
+    const r = EggCore.step(state, a, k);
+    state = r.state; done = r.done; lastAction = a;
+    if (done) endEpisode();
+    updateStatus();
+    updateDebug();
+  }
+
+  function roundState(s) {                            // 日志：2 位小数，按 FIELDS 顺序
+    const o = {};
+    for (const f of EggCore.FIELDS) o[f] = Math.round(s[f] * 100) / 100;
+    return o;
+  }
+
+  function endEpisode() {
+    outcome = EggCore.judge(state, done);
+    for (let i = episodeRowStart; i < LOG.length; i++) LOG[i].outcome = outcome;   // 回填
+    stop();
+  }
+
+  function loop() {
+    tick();
+    if (running && !done) timer = setTimeout(loop, 1000 / speed);
+    else { running = false; timer = null; updateStatus(); }
+  }
+  function start() {
+    if (running || done) { updateStatus(); return; }
+    running = true;
+    timer = setTimeout(loop, 1000 / speed);
+    updateStatus();
+  }
+  function stop() {
+    running = false;
+    if (timer) { clearTimeout(timer); timer = null; }
+    updateStatus();
+  }
+  function setSpeed(x) {
+    if (x !== 1 && x !== 4 && x !== 8) return;
+    speed = x;
+    ['spd1', 'spd4', 'spd8'].forEach(id => $(id).classList.toggle('active', id === 'spd' + x));
+    if (running) { clearTimeout(timer); timer = setTimeout(loop, 1000 / speed); }
+  }
+  function reset() {
+    stop();
+    ep += 1;
+    k = Math.round((0.85 + 0.30 * episodeRng()) * 1000) / 1000;   // 隐藏灶功率，3 位小数
+    state = EggCore.newState();
+    done = null; outcome = null; inputQueue = []; lastAction = 'WAIT';
+    episodeRowStart = LOG.length;
+    drag = null;
+    updateStatus();
+    updateDebug();
+  }
+
+  // 所有输入都走这里：把动作排进队列（每 tick 只执行一个，多余的等待）
+  function dispatch(action) {
+    if (EggCore.ACTIONS.indexOf(action) < 0) { console.warn('未知动作被忽略:', action); return false; }
+    if (done) { flashHint('回合已结束，请先按 Reset。'); return false; }
+    inputQueue.push(action);
+    if (!running) start();            // 一有操作就自动开始计时；Pause 后再操作也会继续
+    updateStatus();
+    return true;
+  }
+
+  function getState() { return Object.assign({}, state); }
+  function getLog() { return LOG.slice(); }
+
+  // 对外接口（CONTRACT 规定的 7 个）；_tick 用 defineProperty 挂成不可枚举，供 smoke_test.js 手动推进
+  const EggGame = { dispatch, getState, reset, setSpeed, start, stop, getLog };
+  Object.defineProperty(EggGame, '_tick', { value: tick, enumerable: false });
+  window.EggGame = EggGame;
+
+  // =====================================================================
+  // 4. 状态栏 / 调试面板
+  // =====================================================================
+  const OUTCOME_HINT = {
+    PERFECT: '两面熟度都在 0.8–1.3 之间，完美！',
+    WASTED:  '误操作：锅不在灶上、或锅里已有蛋时倒油/打蛋。',
+    STUCK:   '没倒油就下蛋，蛋粘在锅底了。',
+    BURNT:   '煎太久，有一面糊了。',
+    TIMEOUT: '300 tick 还没装盘，超时。'
+  };
+  function hintFor(o, s) {             // 只根据 flag / 可见量给一句话解释
+    if (o === 'TORN') return s.flag_stuck === 1 ? '粘底时翻面，蛋被撕裂了。' : '翻面太早，蛋黄破了。';
+    if (o === 'RAW') {
+      if (s.flag_cold === 1) return '下锅时油温不够（或煎的时间不够），没熟。';
+      if (s.flame === 0) return '火没开（或关太早），蛋没熟。';
+      return '煎的时间不够，蛋没熟。';
+    }
+    return OUTCOME_HINT[o] || '';
+  }
+  let hintTimer = null;
+  function flashHint(msg) {            // 临时提示 2 秒后恢复
+    elHint.textContent = msg;
+    if (hintTimer) clearTimeout(hintTimer);
+    hintTimer = setTimeout(() => { hintTimer = null; updateStatus(); }, 2000);
+  }
+  function updateStatus() {
+    if (outcome) {
+      elOutcome.textContent = outcome;
+      elOutcome.className = outcome === 'PERFECT' ? 'ok' : 'bad';
+      if (!hintTimer) elHint.textContent = hintFor(outcome, state) + ' 按 Reset 开始下一回合。';
+    } else {
+      elOutcome.textContent = running ? '煎蛋中…' : (LOG.length === episodeRowStart ? '准备好了' : '已暂停');
+      elOutcome.className = '';
+      if (!hintTimer) elHint.textContent = running ? '上一动作：' + lastAction : '拖拽物体或按键盘 1–9 开始煎蛋（会自动开始计时）。';
+    }
+    const q = inputQueue.length ? '，排队中: ' + inputQueue.join(' → ') : '';
+    // 注意：这里故意不显示日志行数——它等于本回合的 tick 数，属于隐藏量（调试面板里才看得到）
+    elEpisode.textContent = '回合 #' + Math.max(ep, 0) + '  ×' + speed + '  ' + (running ? '运行中' : (done ? '已结束' : '暂停')) + q;
+  }
+  const HIDDEN_FIELDS = { pan_temp: 1, oil_temp: 1, flag_stuck: 1, flag_cold: 1, t: 1 };
+  function updateDebug() {
+    if (!chkDebug.checked) return;
+    let html = '<tr><th>字段</th><th>值</th></tr>';
+    for (const f of EggCore.FIELDS) {
+      const v = typeof state[f] === 'number' ? (Number.isInteger(state[f]) ? state[f] : state[f].toFixed(2)) : state[f];
+      html += '<tr><td class="' + (HIDDEN_FIELDS[f] ? 'hidden-field' : '') + '">' + f + (HIDDEN_FIELDS[f] ? ' (隐)' : '') + '</td><td class="num">' + v + '</td></tr>';
+    }
+    html += '<tr><td class="hidden-field">k (隐)</td><td class="num">' + k + '</td></tr>';
+    html += '<tr><td>cook_up (可见)</td><td class="num">' + EggCore.cookUp(state).toFixed(2) + '</td></tr>';
+    html += '<tr><td class="hidden-field">cook_down (隐)</td><td class="num">' + EggCore.cookDown(state).toFixed(2) + '</td></tr>';
+    html += '<tr><td class="hidden-field">LOG 行数 (隐)</td><td class="num">' + LOG.length + '</td></tr>';
+    debugTable.innerHTML = html;
+  }
+  chkDebug.addEventListener('change', () => { debugTable.style.display = chkDebug.checked ? '' : 'none'; updateDebug(); });
+
+  // =====================================================================
+  // 5. 画面（只画可见量；温度 / t / 朝下面熟度绝不画）
+  // =====================================================================
+  function panCenter() {                       // 锅现在画在哪
+    return state.pan_on_stove === 1 ? { x: LAYOUT.burner.x, y: LAYOUT.burner.y } : LAYOUT.panHome;
+  }
+  function lerp(a, b, u) { return a + (b - a) * u; }
+  function eggWhiteColor(c) {                  // 熟度 → rgba 字符串（分段线性插值）
+    const R = EGG_RAMP;
+    if (c <= R[0][0]) return rgba(R[0]);
+    for (let i = 1; i < R.length; i++) {
+      if (c <= R[i][0]) {
+        const u = (c - R[i - 1][0]) / (R[i][0] - R[i - 1][0]);
+        return 'rgba(' + Math.round(lerp(R[i - 1][1], R[i][1], u)) + ',' + Math.round(lerp(R[i - 1][2], R[i][2], u)) + ',' +
+          Math.round(lerp(R[i - 1][3], R[i][3], u)) + ',' + lerp(R[i - 1][4], R[i][4], u).toFixed(2) + ')';
+      }
+    }
+    return rgba(R[R.length - 1]);
+    function rgba(p) { return 'rgba(' + p[1] + ',' + p[2] + ',' + p[3] + ',' + p[4] + ')'; }
+  }
+  function yolkColor(c) {
+    const u = Math.min(1, Math.max(0, c / 1.5));
+    return 'rgb(' + Math.round(lerp(YOLK_RAW[0], YOLK_BLACK[0], u)) + ',' + Math.round(lerp(YOLK_RAW[1], YOLK_BLACK[1], u)) + ',' + Math.round(lerp(YOLK_RAW[2], YOLK_BLACK[2], u)) + ')';
+  }
+
+  function render() {
+    frame += 1;
+    const W = canvas.width, H = canvas.height;
+    ctx.clearRect(0, 0, W, H);
+    drawTable(W, H);
+    drawStove();
+    drawPlate();
+    drawCarton();
+    drawOilBottle(LAYOUT.oil.x, LAYOUT.oil.y, drag && drag.type === 'oil' ? 0.3 : 1);
+    drawSpatula(LAYOUT.spatula.x, LAYOUT.spatula.y, drag && drag.type === 'spatula' ? 0.3 : 1);
+    if (state.flag_wasted === 1) drawPuddle(LAYOUT.puddle.x, LAYOUT.puddle.y);
+    const pc = panCenter();
+    drawPan(pc.x, pc.y, state.pan_on_stove === 1 ? Math.PI : Math.PI * 0.8, drag && drag.type === 'pan' ? 0.3 : 1);
+    if (state.egg_in_pan === 1 && state.egg_on_plate === 0) drawEgg(pc.x, pc.y, EggCore.cookUp(state), state.flag_torn === 1, drag && drag.type === 'panEgg' ? 0.3 : 1);
+    if (state.egg_on_plate === 1) drawEgg(LAYOUT.plate.x, LAYOUT.plate.y, EggCore.cookUp(state), state.flag_torn === 1, 1);
+    drawLabels();
+    if (drag) drawDragGhost();
+    if (outcome) drawBanner(outcome);
+  }
+
+  function drawTable(W, H) {
+    ctx.fillStyle = COLORS.table; ctx.fillRect(0, 0, W, H);
+    ctx.strokeStyle = COLORS.tableGrain; ctx.lineWidth = 2;
+    for (let y = 20; y < H; y += 36) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y + 6); ctx.stroke(); }
+  }
+  function drawStove() {
+    const S = LAYOUT.stove, B = LAYOUT.burner, K = LAYOUT.knob;
+    ctx.fillStyle = COLORS.stoveEdge; roundRect(S.x - 4, S.y - 4, S.w + 8, S.h + 8, 14); ctx.fill();
+    ctx.fillStyle = COLORS.stove; roundRect(S.x, S.y, S.w, S.h, 12); ctx.fill();
+    // 火（只有有/无，大小固定；微微闪动只是动画）
+    if (state.flame === 1) {
+      const n = 14;
+      for (let i = 0; i < n; i++) {
+        const ang = (i / n) * Math.PI * 2 + (frame % 20 < 10 ? 0.03 : -0.03);
+        const r0 = B.r + 6, r1 = B.r + 26 + ((i + frame >> 3) % 2) * 3;
+        const x0 = B.x + Math.cos(ang) * r0, y0 = B.y + Math.sin(ang) * r0;
+        const x1 = B.x + Math.cos(ang) * r1, y1 = B.y + Math.sin(ang) * r1;
+        flameTongue(x0, y0, x1, y1);
+      }
+    }
+    // 灶眼
+    ctx.fillStyle = COLORS.burner; ctx.beginPath(); ctx.arc(B.x, B.y, B.r, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = COLORS.burnerRing; ctx.lineWidth = 4;
+    for (const rr of [B.r - 8, B.r - 30, B.r - 52]) { ctx.beginPath(); ctx.arc(B.x, B.y, rr, 0, Math.PI * 2); ctx.stroke(); }
+    // 旋钮
+    ctx.fillStyle = state.flame === 1 ? COLORS.knobOn : COLORS.knob;
+    ctx.beginPath(); ctx.arc(K.x, K.y, K.r, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#111'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.strokeStyle = COLORS.knobMark; ctx.lineWidth = 4; ctx.beginPath();
+    const ka = state.flame === 1 ? -Math.PI / 2 : Math.PI;   // 关：指向左；开：指向上
+    ctx.moveTo(K.x, K.y); ctx.lineTo(K.x + Math.cos(ka) * (K.r - 4), K.y + Math.sin(ka) * (K.r - 4)); ctx.stroke();
+    ctx.fillStyle = '#ddd'; ctx.font = '12px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(state.flame === 1 ? 'ON' : 'OFF', K.x, K.y + K.r + 14);
+  }
+  function flameTongue(x0, y0, x1, y1) {
+    const dx = x1 - x0, dy = y1 - y0, nx = -dy * 0.35, ny = dx * 0.35;
+    ctx.beginPath(); ctx.moveTo(x0 + nx, y0 + ny); ctx.quadraticCurveTo(x1 + nx * 0.2, y1 + ny * 0.2, x1, y1);
+    ctx.quadraticCurveTo(x1 - nx * 0.2, y1 - ny * 0.2, x0 - nx, y0 - ny); ctx.closePath();
+    ctx.fillStyle = COLORS.flameOrange; ctx.fill();
+    ctx.beginPath(); ctx.moveTo(x0 + nx * 0.5, y0 + ny * 0.5); ctx.lineTo(x0 + dx * 0.55, y0 + dy * 0.55); ctx.lineTo(x0 - nx * 0.5, y0 - ny * 0.5); ctx.closePath();
+    ctx.fillStyle = COLORS.flameBlue; ctx.fill();
+  }
+  function drawPan(cx, cy, handleAngle, alpha) {
+    ctx.save(); ctx.globalAlpha = alpha;
+    const R = LAYOUT.panR;
+    // 手柄
+    ctx.strokeStyle = COLORS.panHandle; ctx.lineWidth = 18; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(cx + Math.cos(handleAngle) * (R - 6), cy + Math.sin(handleAngle) * (R - 6));
+    ctx.lineTo(cx + Math.cos(handleAngle) * (R + LAYOUT.panHandleLen), cy + Math.sin(handleAngle) * (R + LAYOUT.panHandleLen)); ctx.stroke();
+    // 锅体
+    ctx.fillStyle = COLORS.pan; ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = COLORS.panRim; ctx.lineWidth = 3; ctx.stroke();
+    ctx.fillStyle = COLORS.panInner; ctx.beginPath(); ctx.arc(cx, cy, R - 10, 0, Math.PI * 2); ctx.fill();
+    // 油光：oil=1 才画
+    if (state.oil === 1 && alpha === 1) {
+      const g = ctx.createRadialGradient(cx - 20, cy - 20, 5, cx, cy, R - 10);
+      g.addColorStop(0, COLORS.oilHighlight); g.addColorStop(0.5, COLORS.oilSheen); g.addColorStop(1, 'rgba(255,220,120,0.15)');
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(cx, cy, R - 12, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(cx, cy, R - 24, Math.PI * 1.1, Math.PI * 1.45); ctx.stroke();
+    }
+    ctx.restore();
+  }
+  // 蛋：只按朝上那面的熟度上色；torn = 蛋黄流出
+  function drawEgg(cx, cy, cookUp, torn, alpha) {
+    ctx.save(); ctx.globalAlpha = alpha;
+    const E = LAYOUT.egg;
+    ctx.fillStyle = eggWhiteColor(cookUp);
+    ctx.beginPath();
+    ctx.moveTo(cx - E.rx, cy);
+    ctx.bezierCurveTo(cx - E.rx, cy - E.ry * 1.1, cx - E.rx * 0.3, cy - E.ry * 1.15, cx + E.rx * 0.2, cy - E.ry * 0.9);
+    ctx.bezierCurveTo(cx + E.rx * 0.9, cy - E.ry * 0.7, cx + E.rx * 1.05, cy + E.ry * 0.2, cx + E.rx * 0.6, cy + E.ry * 0.8);
+    ctx.bezierCurveTo(cx + E.rx * 0.1, cy + E.ry * 1.15, cx - E.rx * 0.7, cy + E.ry * 1.05, cx - E.rx, cy);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.12)'; ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.fillStyle = yolkColor(cookUp);
+    if (torn) {
+      // 蛋黄破了：拉长的黄 + 流出的小滴
+      ctx.beginPath(); ctx.ellipse(cx + 4, cy + 2, E.yolkR * 1.6, E.yolkR * 0.8, 0.5, 0, Math.PI * 2); ctx.fill();
+      for (const [dx, dy, r] of [[30, 18, 7], [40, 30, 5], [-18, 26, 6]]) { ctx.beginPath(); ctx.arc(cx + dx, cy + dy, r, 0, Math.PI * 2); ctx.fill(); }
+    } else {
+      ctx.beginPath(); ctx.arc(cx - 4, cy - 2, E.yolkR, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,0.35)'; ctx.beginPath(); ctx.arc(cx - 10, cy - 8, 5, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.restore();
+  }
+  function drawPlate() {
+    const P = LAYOUT.plate;
+    ctx.fillStyle = COLORS.plateEdge; ctx.beginPath(); ctx.arc(P.x, P.y + 2, P.r, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = COLORS.plate; ctx.beginPath(); ctx.arc(P.x, P.y, P.r, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = COLORS.plateInner; ctx.beginPath(); ctx.arc(P.x, P.y, P.r - 16, 0, Math.PI * 2); ctx.fill();
+  }
+  function drawCarton() {
+    const C = LAYOUT.carton;
+    ctx.fillStyle = COLORS.cartonEdge; roundRect(C.x - 3, C.y - 3, C.w + 6, C.h + 6, 8); ctx.fill();
+    ctx.fillStyle = COLORS.carton; roundRect(C.x, C.y, C.w, C.h, 6); ctx.fill();
+    const cw = C.w / C.cols, ch = C.h / C.rows;
+    for (let r = 0; r < C.rows; r++) for (let c = 0; c < C.cols; c++) {
+      const x = C.x + cw * (c + 0.5), y = C.y + ch * (r + 0.5);
+      ctx.fillStyle = 'rgba(0,0,0,0.12)'; ctx.beginPath(); ctx.ellipse(x, y, cw * 0.38, ch * 0.4, 0, 0, Math.PI * 2); ctx.fill();
+      if (!(drag && drag.type === 'egg' && r === 0 && c === 0)) drawShellEgg(x, y, 1);
+    }
+  }
+  function drawShellEgg(x, y, alpha) {
+    ctx.save(); ctx.globalAlpha = alpha;
+    ctx.fillStyle = COLORS.eggShell; ctx.beginPath(); ctx.ellipse(x, y, 22, 28, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = COLORS.eggShellEdge; ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.restore();
+  }
+  function drawOilBottle(x, y, alpha) {
+    const O = LAYOUT.oil;
+    ctx.save(); ctx.globalAlpha = alpha;
+    ctx.fillStyle = COLORS.oilBottle; roundRect(x, y + 25, O.w, O.h - 25, 10); ctx.fill();
+    ctx.strokeStyle = COLORS.oilBottleEdge; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = COLORS.oilBottle; ctx.fillRect(x + O.w * 0.3, y + 8, O.w * 0.4, 20);
+    ctx.fillStyle = COLORS.oilCap; ctx.fillRect(x + O.w * 0.25, y, O.w * 0.5, 10);
+    ctx.fillStyle = 'rgba(255,255,255,0.5)'; ctx.fillRect(x + 8, y + 40, 6, O.h - 60);
+    ctx.fillStyle = '#7a5a00'; ctx.font = 'bold 12px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('OIL', x + O.w / 2, y + O.h * 0.65);
+    ctx.restore();
+  }
+  function drawSpatula(x, y, alpha) {
+    const S = LAYOUT.spatula;
+    ctx.save(); ctx.globalAlpha = alpha;
+    ctx.fillStyle = COLORS.spatula; roundRect(x, y, 90, S.h, 8); ctx.fill();
+    ctx.strokeStyle = '#555'; ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.strokeStyle = '#666'; ctx.lineWidth = 2;
+    for (let i = 1; i <= 3; i++) { ctx.beginPath(); ctx.moveTo(x + 12, y + i * S.h / 4); ctx.lineTo(x + 78, y + i * S.h / 4); ctx.stroke(); }
+    ctx.fillStyle = COLORS.spatulaHandle; roundRect(x + 88, y + S.h / 2 - 7, S.w - 88, 14, 6); ctx.fill();
+    ctx.restore();
+  }
+  function drawPuddle(x, y) {
+    ctx.fillStyle = COLORS.puddle;
+    ctx.beginPath(); ctx.ellipse(x, y, 70, 38, 0.2, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(x + 55, y + 20, 28, 16, -0.3, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = COLORS.puddleYolk; ctx.beginPath(); ctx.ellipse(x - 10, y + 4, 24, 14, 0.4, 0, Math.PI * 2); ctx.fill();
+  }
+  function drawLabels() {
+    ctx.fillStyle = COLORS.label; ctx.font = '13px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('灶', LAYOUT.stove.x + 20, LAYOUT.stove.y + 20);
+    ctx.fillText('盘', LAYOUT.plate.x, LAYOUT.plate.y + LAYOUT.plate.r + 16);
+    ctx.fillText('蛋盒', LAYOUT.carton.x + LAYOUT.carton.w / 2, LAYOUT.carton.y - 8);
+    ctx.fillText('油', LAYOUT.oil.x + LAYOUT.oil.w / 2, LAYOUT.oil.y + LAYOUT.oil.h + 16);
+    ctx.fillText('铲', LAYOUT.spatula.x + 45, LAYOUT.spatula.y - 8);
+    if (state.pan_on_stove === 0) ctx.fillText('锅', LAYOUT.panHome.x, LAYOUT.panHome.y + LAYOUT.panR + 18);
+  }
+  function drawDragGhost() {
+    const x = drag.x, y = drag.y;
+    switch (drag.type) {
+      case 'pan': drawPan(x, y, Math.PI, 0.85); if (state.egg_in_pan === 1 && state.egg_on_plate === 0) drawEgg(x, y, EggCore.cookUp(state), state.flag_torn === 1, 0.85); break;
+      case 'spatula': drawSpatula(x - 45, y - LAYOUT.spatula.h / 2, 0.85); break;
+      case 'oil': drawOilBottle(x - LAYOUT.oil.w / 2, y - LAYOUT.oil.h / 2, 0.85); break;
+      case 'egg': drawShellEgg(x, y, 0.9); break;
+      case 'panEgg': drawEgg(x, y, EggCore.cookUp(state), state.flag_torn === 1, 0.85); break;
+    }
+  }
+  function drawBanner(o) {
+    ctx.fillStyle = COLORS.banner; ctx.fillRect(0, 230, canvas.width, 120);
+    ctx.fillStyle = o === 'PERFECT' ? '#7bed9f' : '#ff7675';
+    ctx.font = 'bold 64px sans-serif'; ctx.textAlign = 'center'; ctx.fillText(o, canvas.width / 2, 300);
+    ctx.fillStyle = '#fff'; ctx.font = '18px sans-serif'; ctx.fillText(hintFor(o, state), canvas.width / 2, 334);
+  }
+  function roundRect(x, y, w, h, r) {
+    ctx.beginPath(); ctx.moveTo(x + r, y); ctx.lineTo(x + w - r, y); ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+    ctx.lineTo(x + w, y + h - r); ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h); ctx.lineTo(x + r, y + h);
+    ctx.quadraticCurveTo(x, y + h, x, y + h - r); ctx.lineTo(x, y + r); ctx.quadraticCurveTo(x, y, x + r, y); ctx.closePath();
+  }
+
+  // =====================================================================
+  // 6. 输入：Pointer Events（鼠标/触控/手势合成的指针事件都走这里）
+  // =====================================================================
+  function dist(ax, ay, bx, by) { return Math.hypot(ax - bx, ay - by); }
+  function inRect(x, y, r) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  function toCanvas(e) {                       // 浏览器坐标 → 画布坐标（画布被 CSS 缩放时也正确）
+    const b = canvas.getBoundingClientRect();
+    return { x: (e.clientX - b.left) * canvas.width / b.width, y: (e.clientY - b.top) * canvas.height / b.height };
+  }
+  // 按下时压住了什么（优先级：旋钮 > 锅里的蛋 > 锅 > 铲 > 油壶 > 蛋盒）
+  function hitTest(x, y) {
+    const K = LAYOUT.knob, pc = panCenter();
+    if (dist(x, y, K.x, K.y) <= K.r + 8) return 'knob';
+    if (state.egg_in_pan === 1 && state.egg_on_plate === 0 && dist(x, y, pc.x, pc.y) <= LAYOUT.egg.rx) return 'panEgg';
+    if (dist(x, y, pc.x, pc.y) <= LAYOUT.panR + 6) return 'pan';
+    const ha = state.pan_on_stove === 1 ? Math.PI : Math.PI * 0.8;   // 手柄（线段附近）
+    const hx = pc.x + Math.cos(ha) * (LAYOUT.panR + LAYOUT.panHandleLen), hy = pc.y + Math.sin(ha) * (LAYOUT.panR + LAYOUT.panHandleLen);
+    if (pointToSegment(x, y, pc.x, pc.y, hx, hy) <= 14) return 'pan';
+    if (inRect(x, y, LAYOUT.spatula)) return 'spatula';
+    if (inRect(x, y, LAYOUT.oil)) return 'oil';
+    if (inRect(x, y, LAYOUT.carton)) return 'egg';
+    return null;
+  }
+  function pointToSegment(px, py, ax, ay, bx, by) {
+    const L2 = (bx - ax) ** 2 + (by - ay) ** 2;
+    const u = Math.max(0, Math.min(1, ((px - ax) * (bx - ax) + (py - ay) * (by - ay)) / L2));
+    return dist(px, py, ax + u * (bx - ax), ay + u * (by - ay));
+  }
+  // 落点判断
+  function overStove(x, y) { return inRect(x, y, LAYOUT.stove); }
+  function overPan(x, y) { const pc = panCenter(); return dist(x, y, pc.x, pc.y) <= LAYOUT.panR + 10; }
+  function overPlate(x, y) { return dist(x, y, LAYOUT.plate.x, LAYOUT.plate.y) <= LAYOUT.plate.r + 10; }
+
+  function onPointerDown(e) {
+    if (e.button !== undefined && e.button !== 0) return;
+    const p = toCanvas(e);
+    const hit = hitTest(p.x, p.y);
+    if (!hit) return;
+    e.preventDefault();
+    if (hit === 'knob') {                      // 点旋钮：开火/关火（按当前画面上的火来切换）
+      dispatch(state.flame === 1 ? 'FLAME_OFF' : 'IGNITE');
+      return;
+    }
+    drag = { type: hit, x: p.x, y: p.y, id: e.pointerId };
+    canvas.classList.add('dragging');
+    try { canvas.setPointerCapture(e.pointerId); } catch (_) { /* 合成事件可能没有 pointerId */ }
+  }
+  function onPointerMove(e) {
+    if (!drag) return;
+    const p = toCanvas(e);
+    drag.x = p.x; drag.y = p.y;
+  }
+  function onPointerUp(e) {
+    if (!drag) return;
+    const p = toCanvas(e);
+    const type = drag.type;
+    drag = null;
+    canvas.classList.remove('dragging');
+    try { canvas.releasePointerCapture(e.pointerId); } catch (_) { }
+    // 【改这里】拖放映射：落点 → 动作（严格按 CONTRACT）
+    switch (type) {
+      case 'pan':
+        if (overStove(p.x, p.y)) dispatch('PLACE_PAN'); else dispatch('REMOVE_PAN');
+        break;
+      case 'oil':
+        if (overPan(p.x, p.y)) dispatch('POUR_OIL'); else flashHint('油壶要放到锅里才会倒油。');
+        break;
+      case 'egg':
+        if (overPan(p.x, p.y)) dispatch('CRACK_EGG'); else flashHint('蛋要放到锅里才会打蛋。');
+        break;
+      case 'spatula':
+        if (overPan(p.x, p.y) && state.egg_in_pan === 1) dispatch('FLIP');
+        else flashHint(state.egg_in_pan === 1 ? '铲子要放到锅里的蛋上才会翻面。' : '锅里没有蛋，铲子没事可做。');
+        break;
+      case 'panEgg':
+        if (overPlate(p.x, p.y)) dispatch('PLATE'); else flashHint('把蛋拖到盘子上才会装盘。');
+        break;
+    }
+  }
+  canvas.addEventListener('pointerdown', onPointerDown);
+  canvas.addEventListener('pointermove', onPointerMove);
+  canvas.addEventListener('pointerup', onPointerUp);
+  canvas.addEventListener('pointercancel', () => { drag = null; canvas.classList.remove('dragging'); });
+
+  // 键盘 1–9 → 9 个动作（CONTRACT 顺序）【改这里】
+  function onKeyDown(e) {
+    const tag = (e.target && e.target.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea') return;      // 在输入框里打字时不触发
+    const d = parseInt(e.key, 10);
+    if (d >= 1 && d <= 9) { dispatch(EggCore.ACTIONS[d - 1]); e.preventDefault(); }
+  }
+  window.addEventListener('keydown', onKeyDown);
+
+  // =====================================================================
+  // 7. 按钮
+  // =====================================================================
+  $('btnStart').addEventListener('click', () => { if (running) stop(); else start(); });
+  $('btnReset').addEventListener('click', reset);
+  $('spd1').addEventListener('click', () => setSpeed(1));
+  $('spd4').addEventListener('click', () => setSpeed(4));
+  $('spd8').addEventListener('click', () => setSpeed(8));
+  function refreshStartButton() { $('btnStart').textContent = running ? 'Pause' : 'Start'; }
+
+  // Self-test
+  $('btnSelfTest').addEventListener('click', () => {
+    const res = EggCore.runSelfTests();
+    let html = '<tr><th>#</th><th>期望</th><th>实际</th><th>结果</th></tr>';
+    let pass = 0;
+    for (const r of res) {
+      if (r.pass) pass += 1;
+      html += '<tr><td>' + r.name + '</td><td>' + r.expected + '</td><td>' + r.got + '</td><td class="' + (r.pass ? 'pass' : 'fail') + '">' + (r.pass ? 'PASS' : 'FAIL') + '</td></tr>';
+    }
+    html += '<tr><td colspan="4"><b>通过 ' + pass + '/' + res.length + '</b>' + (pass === res.length ? '' : '　有 FAIL：说明 egg_core.js 某条规则与计划第 3 节不一致，请对照，不要改常数') + '</td></tr>';
+    $('selfTestTable').innerHTML = html;
+  });
+
+  // Batch：紧循环跑 generateBatch；先把「运行中」画到页面再开始
+  $('btnBatch').addEventListener('click', () => {
+    const N = parseInt($('batchN').value, 10), seed = parseInt($('batchSeed').value, 10);
+    if (!(N > 0) || !Number.isInteger(seed)) { alert('N 必须是正整数，seed 必须是整数'); return; }
+    const prog = $('batchProgress');
+    prog.textContent = '正在生成 0/' + N + ' …（紧循环，页面可能短暂无响应）';
+    $('btnBatch').disabled = true;
+    setTimeout(() => {
+      const t0 = performance.now();                 // 只用于显示耗时，不进模拟
+      const res = EggCore.generateBatch(N, seed, (i, n) => { prog.textContent = '正在生成 ' + i + '/' + n + ' …'; });
+      batchRows = res.rows;
+      const secs = ((performance.now() - t0) / 1000).toFixed(2);
+      prog.textContent = '完成：N=' + N + ' seed=' + seed + '，' + res.rows.length + ' 行，用时 ' + secs + ' s';
+      let txt = '结局计数：\n';
+      for (const o of EggCore.OUTCOMES) txt += '  ' + o.padEnd(8) + String(res.counts[o]).padStart(6) + '  (' + (100 * res.counts[o] / N).toFixed(1) + '%)\n';
+      txt += '策略计数：' + JSON.stringify(res.policyCounts);
+      $('batchOut').textContent = txt; $('batchOut').style.display = '';
+      $('btnBatch').disabled = false; $('btnBatchClear').disabled = false;
+      $('downloadNote').textContent = '目前会下载：批量结果（N=' + N + ', seed=' + seed + '）。点「丢弃批量结果」可改回互动日志。';
+    }, 30);
+  });
+  $('btnBatchClear').addEventListener('click', () => {
+    batchRows = null; $('btnBatchClear').disabled = true; $('batchOut').style.display = 'none'; $('batchProgress').textContent = '';
+    $('downloadNote').textContent = '目前会下载：互动日志（LOG）。运行 Batch 后改为下载批量结果。';
+  });
+
+  // 下载：有批量结果就下批量，否则下互动日志
+  function download(filename, text, mime) {
+    const blob = new Blob([text], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+  function rowsForDownload() {
+    if (batchRows) return { rows: batchRows, name: 'episodes' };
+    // 互动日志：未结束回合的 outcome 写成 null（JSON）/ 空（CSV）
+    return { rows: LOG, name: 'interactive_log' };
+  }
+  $('btnJsonl').addEventListener('click', () => {
+    const d = rowsForDownload();
+    if (!d.rows.length) { alert('还没有日志。先玩一回合或运行 Batch。'); return; }
+    download(d.name + '.jsonl', EggCore.toJSONL(d.rows), 'application/x-ndjson');
+  });
+  $('btnCsv').addEventListener('click', () => {
+    const d = rowsForDownload();
+    if (!d.rows.length) { alert('还没有日志。先玩一回合或运行 Batch。'); return; }
+    download(d.name + '.csv', EggCore.toCSV(d.rows), 'text/csv');
+  });
+
+  // 输入切换：鼠标 / 手势（hand.js 提供 window.EggHand = {start, stop, isRunning}；没有就禁用并给提示）
+  // hand.js 在本文件末尾加载（晚于这段脚本），所以在 load 事件里再查一次。
+  function handAvailable() { return !!(window.EggHand && typeof window.EggHand.start === 'function' && typeof window.EggHand.stop === 'function'); }
+  function refreshHandToggle() {
+    const has = handAvailable();
+    $('inputHand').disabled = !has;
+    $('inputHandLabel').title = has ? '用摄像头手势控制（捏合 = 抓，松开 = 放）' : '未加载 hand.js（手势层尚未构建或文件不在同目录），暂不可用';
+    $('handStatus').textContent = has ? '' : '（hand.js 未加载）';
+  }
+  function onInputModeChange() {
+    const hand = $('inputHand').checked;
+    if (!handAvailable()) { $('inputMouse').checked = true; return; }
+    try {
+      if (hand) {
+        const p = window.EggHand.start();          // hand.js 约定：返回 Promise<boolean>，失败不抛错
+        if (p && typeof p.then === 'function') p.then((ok) => { if (ok === false) { $('inputMouse').checked = true; flashHint('摄像头/手势启动失败，已退回鼠标。' + (window.EggHand.lastError ? '（' + window.EggHand.lastError + '）' : '')); } });
+      } else {
+        window.EggHand.stop();
+      }
+    } catch (err) {
+      console.warn('EggHand 启动失败，退回鼠标：', err);
+      $('inputMouse').checked = true;
+    }
+  }
+  // 每帧把单选框和手势层的真实状态对齐（手势层自己关掉 / 启动中 / 失败时，单选框跟着变；状态文字来自 hand.js 写进隐藏按钮的文字）
+  function syncHandToggle() {
+    if (!handAvailable()) return;
+    const H = window.EggHand;
+    const running = typeof H.isRunning === 'function' ? H.isRunning() : false;
+    const btn = $('hand-toggle');
+    const starting = btn && btn.getAttribute && btn.getAttribute('data-state') === 'starting';
+    if (!starting) { $('inputHand').checked = running; $('inputMouse').checked = !running; }
+    $('handStatus').textContent = running ? '摄像头开' : (starting ? '启动中…' : '');
+  }
+  $('inputMouse').addEventListener('change', onInputModeChange);
+  $('inputHand').addEventListener('change', onInputModeChange);
+  window.addEventListener('load', refreshHandToggle);
+  refreshHandToggle();
+
+  // =====================================================================
+  // 8. 启动
+  // =====================================================================
+  function animate() { render(); refreshStartButton(); syncHandToggle(); requestAnimationFrame(animate); }
+  reset();                         // 第 0 回合
+  if (typeof requestAnimationFrame === 'function') animate(); else render();
+})();
+</script>
+<!-- 手势层（可选）：同目录没有 hand.js 时这一行会静默 404，上面的「手势」单选框保持禁用；
+     有 hand.js 时它只在你切到「手势」后才从 CDN 下载 ml5，平时打开页面不联网。 -->
+<script src="hand.js"></script>
+</body>
+</html>
